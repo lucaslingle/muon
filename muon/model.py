@@ -39,6 +39,7 @@ class TransformerConfig:
     bos_token_id: int
     eos_token_id: int
     pad_token_id: int
+    is_train: bool
 
     @classmethod
     def create(cls, **kwargs):
@@ -72,7 +73,6 @@ class RMSNorm(nn.Module):
 class RotaryPositionEncoding(nn.Module):
     cfg: TransformerConfig
     global_mesh: jax.sharding.Mesh
-    is_queries: bool
 
     @nn.compact
     def __call__(self, x, pos_ids):
@@ -81,17 +81,15 @@ class RotaryPositionEncoding(nn.Module):
         positions = positions[..., None]  # expand along width axis
 
         dimensions = jnp.arange(width // 2)  # half each for sin and cos
-        angular_freqs = jnp.power(self.cfg.rotary_base, -dimensions / (width // 2))
+        angular_freqs = jnp.power(self.cfg.rope_theta, -dimensions / (width // 2))
         angular_freqs = angular_freqs[None, ...]  # expand along length axis
 
         # expand along leading axes, such as batch, group, and query head.
-        if self.is_queries:
+        while positions.ndim < x.ndim:
             positions = positions[None, ...]
             angular_freqs = angular_freqs[None, ...]
-        positions = positions[None, None, ...]
-        angular_freqs = angular_freqs[None, None, ...]
 
-        mesh_axes = AXES["NNNNN"] if self.is_queries else AXES["NNNN"]
+        mesh_axes = tuple(None for _ in range(positions.ndim))
         angles = positions * angular_freqs
         angles = sharding_constraint(angles, mesh_axes, self.global_mesh)
 
@@ -101,7 +99,7 @@ class RotaryPositionEncoding(nn.Module):
         r_even = even * cos - odd * sin
         r_odd = even * sin + odd * cos
 
-        mesh_axes = AXES["XYNNN"] if self.is_queries else AXES["XYNN"]
+        mesh_axes = ("X", "Y") + tuple(None for _ in range(positions.ndim - 2))
         r_even = sharding_constraint(r_even, mesh_axes, self.global_mesh)
         r_odd = sharding_constraint(r_odd, mesh_axes, self.global_mesh)
         r = jnp.concatenate([r_even, r_odd], axis=-1)
@@ -173,9 +171,8 @@ class GroupedQueryAttention(nn.Module):
         k = sharding_constraint(k, AXES["XYNN"], self.global_mesh)
         v = sharding_constraint(v, AXES["XYNN"], self.global_mesh)
 
-        rope_kws = dict(cfg=self.cfg, global_mesh=self.global_mesh)
-        q = RotaryPositionEncoding(**rope_kws, is_queries=True)(q)
-        k = RotaryPositionEncoding(**rope_kws, is_queries=False)(k)
+        q = RotaryPositionEncoding(self.cfg, self.global_mesh)(q)
+        k = RotaryPositionEncoding(self.cfg, self.global_mesh)(k)
         q = sharding_constraint(q, AXES["XYNNN"], self.global_mesh)
         k = sharding_constraint(k, AXES["XYNN"], self.global_mesh)
 
@@ -302,7 +299,7 @@ class Transformer(nn.Module):
     @nn.compact
     def __call__(self, tokens: jax.Array) -> Dict[str, Any]:
         kws = dict(cfg=self.cfg, global_mesh=self.global_mesh)
-        x = nnp.remat(Embedding)(**kws)(tokens)
+        x = Embedding(**kws)(tokens)
         x, _ = nn.scan(
             nnp.remat(TransformerBlock),
             length=self.cfg.n_layer,
@@ -313,6 +310,5 @@ class Transformer(nn.Module):
             out_axes=0,  # use n_layer first for outputted kv cache
             metadata_params={nn.PARTITION_NAME: None},  # no pipeline parallel
         )(**kws)(x, None)
-        x = sharding_constraint(x, AXES["XNY"], self.global_mesh)
-        x = nnp.remat(Unembedding)(**kws)(RMSNorm(**kws, suffix="u")(x))
+        x = Unembedding(**kws)(RMSNorm(**kws, suffix="u")(x))
         return x
